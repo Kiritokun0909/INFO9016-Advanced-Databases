@@ -1,0 +1,6 @@
+.venv
+.idea
+
+/dataset/
+/convert_dataset/
+/prepared_datasets/
