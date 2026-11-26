@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Convert monthly NYC TLC Parquet files to equivalent Parquet, ORC and Arrow IPC files.
+"""Convert the prepared NYC TLC Parquet datasets to equivalent Parquet, ORC and Arrow IPC files.
 
-Each input month is materialized ONCE as a PyArrow Table and written into all
-requested codecs/formats. Months are processed sequentially to limit peak RAM.
+Each input dataset is materialized ONCE as a PyArrow Table and written into all
+requested codecs/formats. Inputs are processed sequentially to limit peak RAM.
 """
 import csv
 import os
@@ -36,32 +36,67 @@ import pyarrow.ipc as ipc
 # Change these values, then run: python convert_formats.py
 INPUT_DIR = Path("prepared_datasets")
 OUTPUT_DIR = Path("convert_dataset")
-# FILE_PATTERN = "yellow_tripdata_2025-*.parquet"
-FILE_PATTERN = "*.parquet"
+FILE_PATTERN = "*.parquet"      # small.parquet, medium.parquet, large.parquet
 CODECS = ["none", "zstd"]       # Either or both
 FORMATS = ["parquet", "orc", "arrow"]  # Any subset
 BATCH_SIZE = 65_536             # Parquet row-group / Arrow record-batch rows
-ZSTD_LEVEL = 3                  # Applies to Parquet only
-VERIFY_OUTPUTS = True          # Read back each output and compare all values
+ZSTD_LEVEL = 3                  # Parquet and Arrow IPC; PyArrow's ORC writer exposes no level
+VERIFY_OUTPUTS = True           # Read back each output and compare all values
 # ================================================================
+
+# ---------------------- FORMAT VERSIONS -------------------------
+# These are the PyArrow writer DEFAULTS. They are passed explicitly in
+# write_output() so the written versions are fixed (they cannot change silently
+# with a PyArrow upgrade) and are recorded in manifest.csv.
+PARQUET_FORMAT_VERSION = "2.6"     # pq.write_table(version=...) default
+PARQUET_DATA_PAGE_VERSION = "1.0"  # pq.write_table(data_page_version=...) default
+ORC_FILE_VERSION = "0.12"          # orc.write_table(file_version=...) default
+ARROW_IPC_METADATA_VERSION = ipc.MetadataVersion.V5  # IpcWriteOptions default
+
+FORMAT_VERSION_LABELS = {
+    "parquet": f"Parquet format {PARQUET_FORMAT_VERSION}, data page v{PARQUET_DATA_PAGE_VERSION}",
+    "orc": f"ORC file version {ORC_FILE_VERSION}",
+    "arrow": f"Arrow IPC file, metadata {ARROW_IPC_METADATA_VERSION.name}",
+}
+# ----------------------------------------------------------------
 
 
 def write_output(table: pa.Table, destination: Path, fmt: str, codec: str,
                  batch_size: int, zstd_level: int) -> None:
-    codec_arg = None if codec == 'none' else 'zstd'
+    """Write `table` to `destination` in the given format and codec.
+
+    Format versions (PyArrow defaults, set explicitly here):
+      * Parquet   : format version "2.6", data page version "1.0".
+                    "2.6" enables the full set of logical types, e.g.
+                    timestamps with microsecond/nanosecond units.
+      * ORC       : file version "0.12" (the current ORC v1 file format;
+                    "0.11" is the only alternative PyArrow offers).
+      * Arrow IPC : random-access *file* format (not the stream format),
+                    metadata version V5 (Arrow >= 1.0).
+
+    Compression:
+      * codec "none" writes uncompressed files in all three formats.
+      * codec "zstd": Parquet and Arrow IPC use level `zstd_level`;
+        PyArrow's ORC writer only exposes the codec, so ORC uses the
+        ORC library's default ZSTD level.
+    """
     if fmt == 'parquet':
         pq.write_table(table, destination,
-                       compression=codec_arg,
+                       compression=(None if codec == 'none' else 'zstd'),
                        compression_level=(zstd_level if codec == 'zstd' else None),
                        row_group_size=batch_size,
                        use_dictionary=True,
-                       version='2.6')
+                       version=PARQUET_FORMAT_VERSION,
+                       data_page_version=PARQUET_DATA_PAGE_VERSION)
     elif fmt == 'orc':
-        # ORC exposes codec selection but no equivalent ZSTD-level writer option.
         orc.write_table(table, destination,
+                        file_version=ORC_FILE_VERSION,
                         compression=('uncompressed' if codec == 'none' else 'zstd'))
     elif fmt == 'arrow':
-        options = ipc.IpcWriteOptions(compression=codec_arg)
+        compression = (None if codec == 'none'
+                       else pa.Codec('zstd', compression_level=zstd_level))
+        options = ipc.IpcWriteOptions(metadata_version=ARROW_IPC_METADATA_VERSION,
+                                      compression=compression)
         with pa.OSFile(str(destination), 'wb') as sink:
             with ipc.new_file(sink, table.schema, options=options) as writer:
                 for batch in table.to_batches(max_chunksize=batch_size):
@@ -146,8 +181,8 @@ def main():
     expected_schema = None
     with manifest_path.open("w", newline="", encoding="utf-8") as handle:
         out = csv.DictWriter(handle, fieldnames=[
-            "input", "output", "format", "codec", "rows", "columns", "bytes",
-            "write_seconds", "verified", "pyarrow_version"
+            "input", "output", "format", "format_version", "codec", "zstd_level",
+            "rows", "columns", "bytes", "write_seconds", "verified", "pyarrow_version"
         ])
         out.writeheader()
         for source in files:
@@ -158,8 +193,8 @@ def main():
                 expected_schema = schema
             elif not schema.equals(expected_schema, check_metadata=False):
                 raise ValueError(
-                    f"Schema differs from first month: {source.name}. "
-                    "Normalize month schemas explicitly before benchmarking."
+                    f"Schema differs from first input: {source.name}. "
+                    "Normalize schemas explicitly before benchmarking."
                 )
             print(f"  {table.num_rows:,} rows, {table.num_columns} columns", flush=True)
             for codec in CODECS:
@@ -175,9 +210,17 @@ def main():
                     except Exception:
                         destination.unlink(missing_ok=True)
                         raise
+                    if codec == "none":
+                        level = ""
+                    elif fmt == "orc":
+                        level = "ORC default"
+                    else:
+                        level = ZSTD_LEVEL
                     result = dict(
                         input=source.name, output=destination.name, format=fmt,
-                        codec=codec, rows=table.num_rows, columns=table.num_columns,
+                        format_version=FORMAT_VERSION_LABELS[fmt],
+                        codec=codec, zstd_level=level,
+                        rows=table.num_rows, columns=table.num_columns,
                         bytes=destination.stat().st_size,
                         write_seconds=f"{duration:.4f}",
                         verified=("yes" if VERIFY_OUTPUTS else "no"),
@@ -187,7 +230,8 @@ def main():
                     handle.flush()
                     print(
                         f"  {destination.name}: {result['bytes'] / 2**20:.2f} MiB, "
-                        f"{duration:.2f}s, verified={result['verified']}",
+                        f"{duration:.2f}s, {result['format_version']}, "
+                        f"verified={result['verified']}",
                         flush=True,
                     )
             del table
